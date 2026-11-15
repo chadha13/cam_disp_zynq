@@ -1,0 +1,396 @@
+; ============================================================================
+;  cam_disp.psm  -  Firmware PicoBlaze (KCPSM6) : camera DVP -> MIPI DSI TX
+;  Assembler :  kcpsm6.exe cam_disp.psm   (produit cam_disp.vhd = ROM, entite "cam_disp")
+;  Plan de ports : voir docs/PORTS.md.  Registres DSI/D-PHY : PG238 v3.0 / PG202 v4.3
+; ============================================================================
+
+; --- ports ---------------------------------------------------------------
+constant P_WD0, 10          ; AXI wdata octets 0..3
+constant P_WD1, 11
+constant P_WD2, 12
+constant P_WD3, 13
+constant P_AD_L, 14         ; AXI adresse bits 7:0
+constant P_AD_H, 15         ; bits 15:8
+constant P_AD_X, 16         ; bit 0 = A16 (0 = controleur DSI, 1 = D-PHY)
+constant P_AXI_CMD, 17      ; bit0 ecriture, bit1 lecture
+constant P_RD0, 18          ; AXI rdata octets 0..3 (lecture)
+constant P_RD1, 19
+constant P_RD2, 1A
+constant P_RD3, 1B
+constant P_AXI_ST, 1C       ; bit0 busy, bit1 erreur (SLVERR/DECERR/timeout)
+constant P_SB_RH, 20        ; SCCB registre (haut / bas) / donnee / commande
+constant P_SB_RL, 21
+constant P_SB_WD, 22
+constant P_SB_CMD, 23       ; bit0 ecriture, bit1 lecture
+constant P_SB_RD, 24
+constant P_SB_ST, 25        ; bit0 busy, bit1 nack
+constant P_CLR, 30          ; bit0 = effacer drapeaux overflow/underrun
+constant P_FLAGS, 31        ; bit0 overflow, bit1 underrun
+constant P_STATE, 33        ; etat FSM (0 IDLE 1 POWER 2 RESET 3 CFG_CAM 4 CFG_DSI 5 RUN 6 FAULT)
+constant P_FSMC, 34         ; bit0 start, bit1 cam_done, bit2 dsi_done, bit3 ack_fault
+constant P_SBDEV, 35        ; adresse SCCB d'ecriture (defaut 78)
+constant P_MS, 39           ; compteur de millisecondes (8 bits)
+constant P_ERR, 3A          ; code d'erreur fatale (LEDs)
+
+constant ST_CFG_CAM, 03
+constant ST_CFG_DSI, 04
+constant ST_FAULT, 06
+
+; --- parametres a adapter ---------------------------------------------------
+constant CAM_ID_H, 56       ; OV5640 : 0x300A = 56, 0x300B = 40
+constant CAM_ID_L, 40
+
+; Registre Protocol Configuration DSI (0x04) : type de donnees RGB888, mode video (impulsions/rafale)
+; -> a calculer depuis PG238 (table "Protocol Configuration Register")
+constant PROTO_B0, 00
+constant PROTO_B1, 00
+constant PROTO_B2, 00
+constant PROTO_B3, 00
+
+; Registres de timing video DSI (0x50..0x6C) : DEPENDENT DE LA DALLE -> procedure de calcul de PG238
+constant T50_B0, 00
+constant T50_B1, 00
+constant T50_B2, 00
+constant T50_B3, 00   ; registre DSI 0x50
+constant T54_B0, 00
+constant T54_B1, 00
+constant T54_B2, 00
+constant T54_B3, 00   ; registre DSI 0x54
+constant T58_B0, 00
+constant T58_B1, 00
+constant T58_B2, 00
+constant T58_B3, 00   ; registre DSI 0x58
+constant T5C_B0, 00
+constant T5C_B1, 00
+constant T5C_B2, 00
+constant T5C_B3, 00   ; registre DSI 0x5c
+constant LINE_B0, 00
+constant LINE_B1, 00
+constant LINE_B2, 00
+constant LINE_B3, 00   ; registre DSI 0x60
+constant BLLP_B0, 00
+constant BLLP_B1, 00
+constant BLLP_B2, 00
+constant BLLP_B3, 00   ; registre DSI 0x64
+constant LPHS_B0, 00
+constant LPHS_B1, 00
+constant LPHS_B2, 00
+constant LPHS_B3, 00   ; registre DSI 0x68
+constant T6C_B0, 00
+constant T6C_B1, 00
+constant T6C_B2, 00
+constant T6C_B3, 00   ; registre DSI 0x6c
+
+; ============================================================================
+address 000
+start:
+ load s0, 00
+ output s0, P_FSMC          ; start=0, done=0
+ load s0, 78
+ output s0, P_SBDEV
+ load s0, 01
+ output s0, P_FSMC          ; start=1 : l'FSM sequence alimentation puis reset capteur
+
+main_loop:
+ input s0, P_STATE
+ compare s0, ST_CFG_CAM
+ jump z, do_cam
+ compare s0, ST_CFG_DSI
+ jump z, do_dsi
+ compare s0, ST_FAULT
+ jump z, do_fault
+ jump main_loop
+
+; ---------------------------------------------------------------------------
+; Etat CFG_CAM : verification d'ID, reset logiciel, format RGB565, streaming
+; ---------------------------------------------------------------------------
+do_cam:
+ load s3, 03                ; 3 tentatives
+dc_try:
+ load s5, 30
+ load s4, 0A
+ call sccb_rd
+ compare s6, CAM_ID_H
+ jump nz, dc_bad
+ load s5, 30
+ load s4, 0B
+ call sccb_rd
+ compare s6, CAM_ID_L
+ jump nz, dc_bad
+ jump dc_cfg
+dc_bad:
+ sub s3, 01
+ jump z, fatal_cam
+ load s2, 0A
+ call delay_ms
+ jump dc_try
+dc_cfg:
+ load s5, 30                ; 0x3008 = 0x82 : reset logiciel
+ load s4, 08
+ load s6, 82
+ call sccb_wr
+ load s2, 14                ; 20 ms
+ call delay_ms
+ ; >>> TABLE DE CONFIGURATION DU CAPTEUR (PLL, resolution, timing DVP, ...) A INSERER ICI <<<
+ ;     une serie de :  load s5,HH / load s4,LL / load s6,VV / call sccb_wr
+ load s5, 43                ; 0x4300 = 0x61 : sortie RGB565
+ load s4, 00
+ load s6, 61
+ call sccb_wr
+ load s5, 50                ; 0x501F = 0x01 : chemin ISP RGB
+ load s4, 1F
+ load s6, 01
+ call sccb_wr
+ load s5, 30                ; 0x3008 = 0x02 : sortie de power-down logiciel (streaming)
+ load s4, 08
+ load s6, 02
+ call sccb_wr
+ load s0, 03                ; start + cam_done
+ output s0, P_FSMC
+dc_wait:
+ input s0, P_STATE
+ compare s0, ST_CFG_CAM
+ jump z, dc_wait
+ jump main_loop
+
+; ---------------------------------------------------------------------------
+; Etat CFG_DSI : D-PHY (PG202) puis controleur DSI (PG238, "Case 6" mode video)
+; ---------------------------------------------------------------------------
+do_dsi:
+ ; D-PHY CONTROL (0x1_0000) : SRST=1 puis SRST=0, DPHY_EN=1
+ load s8, 00
+ load s9, 00
+ load sA, 01
+ load s7, 00
+ load s6, 00
+ load s5, 00
+ load s4, 03
+ call axi_wr32
+ test s0, 02
+ jump nz, fatal_axi
+ load s4, 02
+ call axi_wr32
+ test s0, 02
+ jump nz, fatal_axi
+ ; attendre INIT_DONE (bit3) et STOP_STATE (bit6) sur DL0_STATUS (0x1_001C), max ~1,3 s
+ load s3, FF
+dp_wait:
+ load s8, 1C
+ load s9, 00
+ load sA, 01
+ call axi_rd32
+ test s0, 02
+ jump nz, fatal_axi
+ and s4, 48
+ compare s4, 48
+ jump z, dp_ok
+ load s2, 05
+ call delay_ms
+ sub s3, 01
+ jump nz, dp_wait
+ jump fatal_dphy
+dp_ok:
+ ; controleur DSI : core_en=0 pendant la programmation (0x00 = 0)
+ load s4, 00
+ load s5, 00
+ load s6, 00
+ load s7, 00
+ load s8, 00
+ call wr_dsi
+ ; Protocol Configuration (0x04)
+ load s4, PROTO_B0
+ load s5, PROTO_B1
+ load s6, PROTO_B2
+ load s7, PROTO_B3
+ load s8, 04
+ call wr_dsi
+ ; registres de timing video
+ load s4, T50_B0
+ load s5, T50_B1
+ load s6, T50_B2
+ load s7, T50_B3
+ load s8, 50
+ call wr_dsi
+ load s4, T54_B0
+ load s5, T54_B1
+ load s6, T54_B2
+ load s7, T54_B3
+ load s8, 54
+ call wr_dsi
+ load s4, T58_B0
+ load s5, T58_B1
+ load s6, T58_B2
+ load s7, T58_B3
+ load s8, 58
+ call wr_dsi
+ load s4, T5C_B0
+ load s5, T5C_B1
+ load s6, T5C_B2
+ load s7, T5C_B3
+ load s8, 5C
+ call wr_dsi
+ load s4, LINE_B0
+ load s5, LINE_B1
+ load s6, LINE_B2
+ load s7, LINE_B3
+ load s8, 60
+ call wr_dsi
+ load s4, BLLP_B0
+ load s5, BLLP_B1
+ load s6, BLLP_B2
+ load s7, BLLP_B3
+ load s8, 64
+ call wr_dsi
+ load s4, LPHS_B0
+ load s5, LPHS_B1
+ load s6, LPHS_B2
+ load s7, LPHS_B3
+ load s8, 68
+ call wr_dsi
+ load s4, T6C_B0
+ load s5, T6C_B1
+ load s6, T6C_B2
+ load s7, T6C_B3
+ load s8, 6C
+ call wr_dsi
+ ; core_en=1, command_mode=0, ulps_mode=0 (0x00 = 1)
+ load s4, 01
+ load s5, 00
+ load s6, 00
+ load s7, 00
+ load s8, 00
+ call wr_dsi
+ load s0, 07                ; start + cam_done + dsi_done
+ output s0, P_FSMC
+dd_wait:
+ input s0, P_STATE
+ compare s0, ST_CFG_DSI
+ jump z, dd_wait
+ jump main_loop
+
+; ---------------------------------------------------------------------------
+; Etat FAULT : purge, coupe le coeur DSI, acquitte -> l'FSM reconfigure tout
+; ---------------------------------------------------------------------------
+do_fault:
+ load s0, 01
+ output s0, P_FSMC          ; retire cam_done / dsi_done
+ output s0, P_CLR           ; efface les drapeaux collants
+ load s2, 02
+ call delay_ms
+ load s4, 00                ; core_en=0
+ load s5, 00
+ load s6, 00
+ load s7, 00
+ load s8, 00
+ call wr_dsi
+ load s0, 00
+ output s0, P_CLR
+ load s0, 09                ; start + ack_fault
+ output s0, P_FSMC
+ load s2, 02
+ call delay_ms
+ load s0, 01
+ output s0, P_FSMC
+df_wait:
+ input s0, P_STATE
+ compare s0, ST_FAULT
+ jump z, df_wait
+ jump main_loop
+
+; ---------------------------------------------------------------------------
+; Erreurs fatales : code sur P_ERR, FSM -> IDLE (camera en power-down), arret
+; ---------------------------------------------------------------------------
+fatal_cam:
+ load s0, 01
+ jump fatal
+fatal_axi:
+ load s0, 02
+ jump fatal
+fatal_dphy:
+ load s0, 03
+fatal:
+ output s0, P_ERR
+ load s1, 00
+ output s1, P_FSMC
+fatal_loop:
+ jump fatal_loop
+
+; ============================ SOUS-PROGRAMMES ===============================
+; delay_ms : attend s2 millisecondes (s2 >= 2 pour >= 1 ms garanti) ; detruit s0, s1
+delay_ms:
+ input s0, P_MS
+dm_loop:
+ input s1, P_MS
+ sub s1, s0
+ compare s1, s2
+ jump c, dm_loop
+ return
+
+; sccb_wr : s5:s4 = adresse registre, s6 = donnee ; detruit s0
+sccb_wr:
+ output s5, P_SB_RH
+ output s4, P_SB_RL
+ output s6, P_SB_WD
+ load s0, 01
+ output s0, P_SB_CMD
+sw_wait:
+ input s0, P_SB_ST
+ test s0, 01
+ jump nz, sw_wait
+ return
+
+; sccb_rd : s5:s4 = adresse registre -> s6 = donnee ; detruit s0
+sccb_rd:
+ output s5, P_SB_RH
+ output s4, P_SB_RL
+ load s0, 02
+ output s0, P_SB_CMD
+sr_wait:
+ input s0, P_SB_ST
+ test s0, 01
+ jump nz, sr_wait
+ input s6, P_SB_RD
+ return
+
+; axi_wr32 : s7..s4 = donnee (MSB..LSB), sA:s9:s8 = adresse ; retourne s0 = statut (bit1 = erreur)
+axi_wr32:
+ output s4, P_WD0
+ output s5, P_WD1
+ output s6, P_WD2
+ output s7, P_WD3
+ output s8, P_AD_L
+ output s9, P_AD_H
+ output sA, P_AD_X
+ load s0, 01
+ output s0, P_AXI_CMD
+aw_wait:
+ input s0, P_AXI_ST
+ test s0, 01
+ jump nz, aw_wait
+ return
+
+; axi_rd32 : sA:s9:s8 = adresse ; retourne s7..s4 = donnee, s0 = statut
+axi_rd32:
+ output s8, P_AD_L
+ output s9, P_AD_H
+ output sA, P_AD_X
+ load s0, 02
+ output s0, P_AXI_CMD
+ar_wait:
+ input s0, P_AXI_ST
+ test s0, 01
+ jump nz, ar_wait
+ input s4, P_RD0
+ input s5, P_RD1
+ input s6, P_RD2
+ input s7, P_RD3
+ return
+
+; wr_dsi : ecrit s7..s4 dans le controleur DSI a l'offset s8 (A16=0) ; saute en erreur fatale si SLVERR
+wr_dsi:
+ load s9, 00
+ load sA, 00
+ call axi_wr32
+ test s0, 02
+ jump nz, fatal_axi
+ return

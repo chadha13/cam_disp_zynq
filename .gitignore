@@ -1,0 +1,13 @@
+# Vivado / sorties de build
+vivado/
+*.jou
+*.log
+*.str
+.Xil/
+# GHDL
+*.cf
+work-obj*/
+*.o
+# Fichiers AMD sous licence : à ne pas republier
+rtl_extra/kcpsm6.vhd
+rtl_extra/cam_disp.vhd
